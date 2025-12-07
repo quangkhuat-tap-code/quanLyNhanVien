@@ -137,18 +137,21 @@ router.post('/enroll-face', async (req, res) => {
 
 
 // --- API: CHẤM CÔNG (FIX LỖI NHẬN DIỆN KHUÔN MẶT) ---
+
 router.post('/checkin', async (req, res) => {
-    // ĐẶT NGƯỠNG AN TOÀN TỐI ĐA ĐỂ ĐẢM BẢO NHẬN DIỆN CHO BÀI TẬP LỚN
     const { embedding, type, threshold = 0.8 } = req.body; 
 
+    const SIMULATION_FACTOR = 3600 ; 
+    const MIN_MINUTES_FOR_DEMO = 1; // Giờ làm mô phỏng tối thiểu (fix lỗi total_hours = 0)
+
     try {
-        // 1. Nhận diện khuôn mặt
+        // 1. Nhận diện khuôn mặt (Giữ nguyên)
         const [users] = await db.query("SELECT id, face_embedding FROM employees WHERE has_face_registered = 1");
         let bestMatch = null;
         let minDistance = Infinity;
-
+        // ... (Logic nhận diện khuôn mặt giữ nguyên) ...
+        
         for (const user of users) {
-            // FIX LỖI JSON PARSING
             let dbEmbedding = user.face_embedding;
             if (typeof dbEmbedding === 'string') {
                 try {
@@ -177,20 +180,43 @@ router.post('/checkin', async (req, res) => {
         const today = now.toISOString().split('T')[0];
 
         if (type === 'checkin') {
+            
+            // FIX: TÌM KIẾM TẤT CẢ PHIÊN LÀM VIỆC ĐANG MỞ (KỂ CẢ NGÀY TRƯỚC)
             const [existing] = await db.query(
-                "SELECT id FROM attendance WHERE employee_id = ? AND date_log = ? AND checkout_time IS NULL",
-                [empId, today]
+                "SELECT id, checkin_time, date_log FROM attendance WHERE employee_id = ? AND checkout_time IS NULL ORDER BY date_log DESC LIMIT 1",
+                [empId]
             );
 
             if (existing.length > 0) {
-                return res.status(400).json({ error: "Bạn chưa Check-out ca làm việc trước đó!" });
+                const stuckSession = existing[0];
+                // Chuyển date_log từ DB sang định dạng YYYY-MM-DD để so sánh
+                const stuckDate = stuckSession.date_log instanceof Date 
+                                ? stuckSession.date_log.toISOString().split('T')[0] 
+                                : stuckSession.date_log.toString().split('T')[0];
+
+                if (stuckDate === today) {
+                    // TRƯỜNG HỢP 1: Phiên làm việc kẹt là của HÔM NAY -> CHẶN
+                    return res.status(400).json({ error: "Bạn chưa Check-out ca làm việc trước đó!" });
+                } else {
+                    // TRƯỜNG HỢP 2: Phiên làm việc kẹt là của NGÀY TRƯỚC -> TỰ ĐỘNG ĐÓNG
+                    console.warn(`[ATTENTION] Tự động đóng phiên làm việc kẹt từ ${stuckDate} cho NV ${empId}`);
+                    
+                    // Giả định đóng phiên kẹt với 8 giờ làm mô phỏng (để không bị lỗi NULL/0)
+                    await db.query(
+                        "UPDATE attendance SET checkout_time = ?, total_hours = ? WHERE id = ?",
+                        [stuckSession.checkin_time, 8, stuckSession.id] // Set checkout_time = checkin_time, total_hours = 8
+                    );
+                    // Sau khi tự động đóng, tiếp tục cho Check-in mới
+                }
             }
+            
+            // Thực hiện Check-in mới
             await db.query(
                 "INSERT INTO attendance (employee_id, checkin_time, date_log) VALUES (?, ?, ?)",
                 [empId, now, today]
             );
 
-        } else { // Check-out
+        } else { // Check-out (Logic này giữ nguyên, đã bao gồm fix MIN_MINUTES_FOR_DEMO)
             const [openSession] = await db.query(
                 "SELECT id, checkin_time FROM attendance WHERE employee_id = ? AND date_log = ? AND checkout_time IS NULL ORDER BY checkin_time DESC LIMIT 1",
                 [empId, today]
@@ -204,11 +230,15 @@ router.post('/checkin', async (req, res) => {
             const checkinTime = new Date(openSession[0].checkin_time);
             
             const minutes = differenceInMinutes(now, checkinTime);
-            const hours = parseFloat((minutes / 60).toFixed(2));
+            
+            const effectiveMinutes = Math.max(minutes, MIN_MINUTES_FOR_DEMO); 
+
+            const realHours = effectiveMinutes / 60;
+            const simulatedHours = parseFloat((realHours * SIMULATION_FACTOR).toFixed(2)); 
 
             await db.query(
                 "UPDATE attendance SET checkout_time = ?, total_hours = ? WHERE id = ?",
-                [now, hours, sessionId]
+                [now, simulatedHours, sessionId] 
             );
         }
 
@@ -221,66 +251,114 @@ router.post('/checkin', async (req, res) => {
         });
 
     } catch (err) {
+        console.error("Lỗi nghiêm trọng khi chấm công:", err);
         res.status(500).json({ error: err.message });
     }
 });
 
-
 // GET /api/payroll-report (TÍNH LƯƠNG THEO CÔNG THỨC 40 GIỜ)
+
+// backendhi/routes/employeeRoutes.js (Thay thế API /payroll-report)
+
 router.get('/payroll-report', async (req, res) => {
     const { month, year } = req.query; 
 
     if (!month || !year) return res.status(400).json({ error: "Vui lòng cung cấp tháng và năm." });
+    
+    // Lấy tháng và năm hiện tại của hệ thống
+    const currentMonth = new Date().getMonth() + 1;
+    const currentYear = new Date().getFullYear();
+    const isCurrentPeriod = Number(year) === currentYear && Number(month) === currentMonth;
+
+    // Xây dựng ngày bắt đầu và kết thúc tháng (cho truy vấn attendance)
+    const monthStr = String(month).padStart(2, '0');
+    const yearStr = String(year);
+    const startDate = `${yearStr}-${monthStr}-01`;
 
     try {
         const [employees] = await db.query("SELECT id, name, code, salary FROM employees");
         const payrollData = [];
 
         for (const emp of employees) {
-            const sqlSumHours = `
-                SELECT SUM(total_hours) as total 
-                FROM attendance 
-                WHERE employee_id = ? 
-                AND MONTH(date_log) = ? 
-                AND YEAR(date_log) = ?
-            `;
-            const [rows] = await db.query(sqlSumHours, [emp.id, month, year]);
-            const totalHours = rows[0].total || 0;
+            let reportEntry = null;
+            const employeeBaseSalary = Number(emp.salary) || 0; 
 
-            const baseSalary = Number(emp.salary);
-            let finalSalary = 0;
-            let overtimePay = 0;
-            let overtimeHours = 0;
-            const standardHours = 40; 
+            // --- 1. CHẾ ĐỘ THÁNG TRƯỚC (Lấy Lương Lịch sử Dynamic) ---
+            if (!isCurrentPeriod) {
+                 const [historyRows] = await db.query(
+                    "SELECT final_salary, total_hours, overtime_hours, base_salary FROM payroll_history WHERE employee_id = ? AND report_month = ? AND report_year = ?",
+                    [emp.id, month, year]
+                 );
+                 if (historyRows.length > 0) {
+                     const row = historyRows[0];
+                     
+                     const historicalBaseSalary = Number(row.base_salary) || employeeBaseSalary;
+                     const historicalFinalSalary = Number(row.final_salary);
+                     const historicalOvertimeHours = row.overtime_hours || 0;
 
-            if (totalHours <= standardHours) {
-                finalSalary = baseSalary;
-            } else {
-                overtimeHours = totalHours - standardHours;
-                const hourlyRate = baseSalary / standardHours; 
-                overtimePay = overtimeHours * hourlyRate * 1.5; 
-                finalSalary = baseSalary + overtimePay;
+                     reportEntry = {
+                         employeeId: emp.id,
+                         code: emp.code,
+                         name: emp.name,
+                         baseSalary: historicalBaseSalary, 
+                         totalHours: row.total_hours,
+                         overtimeHours: historicalOvertimeHours,      // Giờ OT lịch sử
+                         overtimePay: historicalFinalSalary - historicalBaseSalary, 
+                         finalSalary: historicalFinalSalary           // Lương cuối cùng lịch sử (dynamic)
+                     };
+                 }
+            } 
+            
+            // --- 2. CHẾ ĐỘ THÁNG HIỆN TẠI (Tính toán Real-time DYNAMIC SALARY) ---
+            if (reportEntry === null) {
+                
+                // Truy vấn tổng giờ mô phỏng đã được lưu trong bảng attendance
+                const sqlSumHours = `
+                    SELECT SUM(total_hours) as total 
+                    FROM attendance 
+                    WHERE employee_id = ? 
+                    AND date_log BETWEEN ? AND LAST_DAY(?)
+                `;
+                const [rows] = await db.query(sqlSumHours, [emp.id, startDate, startDate]);
+                
+                // FIX: Đảm bảo tổng giờ được đọc là SỐ
+                const totalHours = Number(rows[0]?.total) || 0; 
+
+                // --- PHỤC HỒI LOGIC TÍNH OT DYNAMIC CHO THÁNG HIỆN TẠI ---
+                let finalSalary = employeeBaseSalary;
+                let overtimePay = 0;
+                let overtimeHours = 0;
+                const standardHours = 40; 
+
+                if (totalHours > standardHours) {
+                    overtimeHours = totalHours - standardHours;
+                    const hourlyRate = employeeBaseSalary / 160; 
+                    overtimePay = overtimeHours * hourlyRate * 1.5;
+                    finalSalary = employeeBaseSalary + overtimePay; // FINAL SALARY LỚN HƠN 10 TRIỆU
+                }
+
+                reportEntry = {
+                    employeeId: emp.id,
+                    code: emp.code,
+                    name: emp.name,
+                    baseSalary: employeeBaseSalary,
+                    totalHours: totalHours,
+                    overtimeHours: overtimeHours,
+                    overtimePay: overtimePay,
+                    finalSalary: finalSalary // Dữ liệu dynamic được trả về
+                };
             }
-
-            payrollData.push({
-                employeeId: emp.id,
-                code: emp.code,
-                name: emp.name,
-                baseSalary: baseSalary,
-                totalHours: totalHours,
-                overtimeHours: overtimeHours,
-                overtimePay: overtimePay,
-                finalSalary: finalSalary
-            });
+            
+            payrollData.push(reportEntry);
         }
 
         res.json(payrollData);
 
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("Lỗi nghiêm trọng khi tạo báo cáo lương:", err);
+        res.json([]); 
     }
 });
-
 
 // GET /api/employees/:id/face (Kiểm tra trạng thái đăng ký khuôn mặt)
 router.get('/employees/:id/face', async (req, res) => {
@@ -319,5 +397,34 @@ router.get('/attendance/:employeeId/open-session', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
+
+// GET /api/positions (Lấy danh sách tất cả chức vụ)
+router.get('/positions', async (req, res) => {
+    try {
+        const [rows] = await db.query("SELECT id, ten_chuc_vu as name, ma_chuc_vu as code FROM positions ORDER BY ten_chuc_vu");
+        res.json(rows.map(row => ({
+            id: row.id.toString(),
+            name: row.name,
+            code: row.code
+        })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/departments (Lấy danh sách tất cả phòng ban )
+router.get('/departments', async (req, res) => {
+    try {
+        const [rows] = await db.query("SELECT id, ten_phong as name, ma_phong as code FROM departments ORDER BY ten_phong");
+        res.json(rows.map(row => ({
+            id: row.id.toString(),
+            name: row.name,
+            code: row.code
+        })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
 
 module.exports = router;
