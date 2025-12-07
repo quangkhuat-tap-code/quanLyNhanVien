@@ -3,6 +3,7 @@ import { apiFetch } from './api';
 import type { NewPositionData } from '../components/ui/AddPositionModal';
 import type { PositionEditData } from '../components/ui/EditPositionModal';
 
+
 const API = (import.meta.env.VITE_API_BASE_URL as string) || 'http://localhost:5000';
 
 // Kiểu dữ liệu trả về từ API (dùng tên cột MySQL)
@@ -46,3 +47,4 @@ export const positionsService = {
     });
   },
 };
+

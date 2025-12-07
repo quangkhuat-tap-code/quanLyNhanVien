@@ -41,3 +41,6 @@ export const departmentsService = {
     });
   },
 };
+
+// src/services/departmentsService.ts (Ví dụ)
+

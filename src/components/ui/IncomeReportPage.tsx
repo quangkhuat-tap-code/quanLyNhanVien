@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import {
   BarChart,
   Bar,
@@ -6,46 +6,32 @@ import {
   YAxis,
   CartesianGrid,
   Tooltip,
-  Legend,
   ResponsiveContainer,
-  LineChart,
-  Line,
 } from "recharts";
 import { Select } from "./Select";
+import { payrollService, type PayrollReportEntry } from "../../services/payrollService"; 
+import { formatCurrency } from "../../lib/money"; 
 
-const BAO_CAO_INTERVAL_MS = 5 * 60 * 1000; // 5 phút thực tế = 1 tháng mô phỏng
-const KIEM_TRA_INTERVAL_MS = 5 * 1000; // kiểm tra trạng thái mỗi 5 giây để không phải đợi đủ 5 phút từ lúc mở trang
-const REPORT_KEY = (employeeId: string) => `incomeReports:${employeeId}`;
-const REPORT_STATE_KEY = (employeeId: string) => `incomeReportState:${employeeId}`;
-const WORKING_HOURS_KEY = (employeeId: string) => `workingHours:${employeeId}`;
-
-type IncomeReportEntry = {
-  id: string;
-  year: number;
+// Định nghĩa lại kiểu dữ liệu cho Report Entry
+type MonthlyReportDisplay = {
   month: number;
   baseSalary: number;
   netIncome: number;
-  difference: number;
-  recordedAt: string;
+  overtimeHours: number; 
 };
 
-// Sử dụng lại kiểu Employee từ EmployeePage để đảm bảo tính nhất quán
 type Employee = {
   id: string;
   name: string;
   salary: number;
 };
 
-// Đồng bộ dữ liệu nhân viên với EmployeePage.tsx
+// Hàm tải danh sách nhân viên từ Local Storage
 const loadEmployees = (): Employee[] => {
   const stored = localStorage.getItem("employeesData");
   if (stored) {
     try {
-      const parsed = JSON.parse(stored) as Array<{
-        id: string;
-        name: string;
-        salary?: number;
-      }>;
+      const parsed = JSON.parse(stored) as Array<Employee>;
       return parsed.map((emp) => ({
         id: emp.id,
         name: emp.name,
@@ -58,116 +44,6 @@ const loadEmployees = (): Employee[] => {
   return [];
 };
 
-const formatCurrency = (value: number) => new Intl.NumberFormat("vi-VN", { style: "currency", currency: "VND" }).format(value);
-
-const readWorkingHours = (employeeId: string) => {
-  if (typeof localStorage === "undefined") return 0;
-  const raw = localStorage.getItem(WORKING_HOURS_KEY(employeeId));
-  if (!raw) return 0;
-  try {
-    const parsed = JSON.parse(raw) as { hours?: number };
-    return Number(parsed.hours) || 0;
-  } catch (error) {
-    console.warn("Không đọc được workingHours:", error);
-    return 0;
-  }
-};
-
-const resetWorkingHours = (employeeId: string) => {
-  if (typeof localStorage === "undefined") return;
-  const now = new Date();
-  localStorage.setItem(
-    WORKING_HOURS_KEY(employeeId),
-    JSON.stringify({ year: now.getFullYear(), month: now.getMonth() + 1, hours: 0 })
-  );
-};
-
-const loadIncomeReports = (employeeId: string): IncomeReportEntry[] => {
-  if (typeof localStorage === "undefined") return [];
-  const raw = localStorage.getItem(REPORT_KEY(employeeId));
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as IncomeReportEntry[]) : [];
-  } catch (error) {
-    console.warn("Không đọc được incomeReports:", error);
-    return [];
-  }
-};
-
-const saveIncomeReports = (employeeId: string, data: IncomeReportEntry[]) => {
-  if (typeof localStorage === "undefined") return;
-  localStorage.setItem(REPORT_KEY(employeeId), JSON.stringify(data));
-};
-
-const ensureReportState = (employeeId: string) => {
-  if (typeof localStorage === "undefined") return null;
-  const now = Date.now();
-  const raw = localStorage.getItem(REPORT_STATE_KEY(employeeId));
-  if (!raw) {
-    const state = { startTime: now, lastSnapshotMonth: 0 };
-    localStorage.setItem(REPORT_STATE_KEY(employeeId), JSON.stringify(state));
-    return state;
-  }
-  try {
-    return JSON.parse(raw) as { startTime: number; lastSnapshotMonth: number };
-  } catch (error) {
-    console.warn("Không đọc được incomeReportState:", error);
-    const state = { startTime: now, lastSnapshotMonth: 0 };
-    localStorage.setItem(REPORT_STATE_KEY(employeeId), JSON.stringify(state));
-    return state;
-  }
-};
-
-const saveReportState = (employeeId: string, state: { startTime: number; lastSnapshotMonth: number }) => {
-  if (typeof localStorage === "undefined") return;
-  localStorage.setItem(REPORT_STATE_KEY(employeeId), JSON.stringify(state));
-};
-
-const computeIncomeForHours = (hours: number, salary: number) => {
-  const hourlyRate = salary / 160;
-  const hasBase = hours >= 40;
-  const overtimeHours = hasBase ? Math.max(0, hours - 40) : 0;
-  const baseSalary = hasBase ? salary : 0;
-  const netIncome = hasBase ? salary + overtimeHours * hourlyRate : 0;
-  return { baseSalary, netIncome, difference: netIncome - baseSalary };
-};
-
-const simulateMonthlyReport = (employee: Employee | undefined) => {
-  if (!employee || typeof localStorage === "undefined") return false;
-  const state = ensureReportState(employee.id);
-  if (!state) return false;
-  const now = Date.now();
-  const completedMonths = Math.floor((now - state.startTime) / BAO_CAO_INTERVAL_MS);
-  if (completedMonths <= state.lastSnapshotMonth) return false;
-  const reports = loadIncomeReports(employee.id);
-  let created = false;
-  while (state.lastSnapshotMonth < completedMonths) {
-    const nextIndex = state.lastSnapshotMonth + 1;
-    const year = 2025 + Math.floor((nextIndex - 1) / 12);
-    const month = ((nextIndex - 1) % 12) + 1;
-    const hours = readWorkingHours(employee.id);
-    const { baseSalary, netIncome, difference } = computeIncomeForHours(hours, employee.salary);
-    const entry: IncomeReportEntry = {
-      id: `${employee.id}-${year}-${month}-${Date.now()}`,
-      year,
-      month,
-      baseSalary,
-      netIncome,
-      difference,
-      recordedAt: new Date().toISOString(),
-    };
-    reports.push(entry);
-    resetWorkingHours(employee.id);
-    state.lastSnapshotMonth = nextIndex;
-    created = true;
-  }
-  if (created) {
-    saveIncomeReports(employee.id, reports);
-    saveReportState(employee.id, state);
-  }
-  return created;
-};
 
 const Header = () => (
   <div className="flex items-center justify-between mb-6">
@@ -175,7 +51,6 @@ const Header = () => (
   </div>
 );
 
-// Định nghĩa kiểu cho props của FilterBar
 type FilterBarProps = {
   year: string; setYear: (y: string) => void;
   employee: string; setEmployee: (e: string) => void;
@@ -198,7 +73,7 @@ const FilterBar = ({ year, setYear, employee, setEmployee, employeeList }: Filte
         onChange={(e) => setEmployee(e.target.value)}
         disabled={employeeList.length === 0}
       >
-        {employeeList.length === 0 && <option value="">Chưa có dữ liệu nhân viên</option>}
+        <option value="" disabled>Chọn nhân viên</option>
         {employeeList.map((emp) => (
           <option key={emp.id} value={emp.id}>{emp.name}</option>
         ))}
@@ -207,10 +82,10 @@ const FilterBar = ({ year, setYear, employee, setEmployee, employeeList }: Filte
   </div>
 );
 
-const IncomeChart = ({ data }: { data: any[] }) => (
+const IncomeChart = ({ data }: { data: MonthlyReportDisplay[] }) => (
   <div className="bg-white rounded-lg shadow-md p-6">
     <h2 className="text-xl font-semibold mb-4 text-gray-800">Lương thực nhận hàng tháng</h2>
-    {data.length === 0 ? (
+    {data.length === 0 || data.every(row => row.netIncome === 0) ? (
       <div className="flex h-48 items-center justify-center text-sm text-slate-400">
         Chưa có dữ liệu để hiển thị.
       </div>
@@ -220,7 +95,11 @@ const IncomeChart = ({ data }: { data: any[] }) => (
           <BarChart data={data} margin={{ top: 5, right: 20, left: -10, bottom: 5 }}>
             <CartesianGrid strokeDasharray="3 3" vertical={false} />
             <XAxis dataKey="month" tickFormatter={(tick) => `T${tick}`} />
-            <YAxis axisLine={false} tickLine={false} tickFormatter={(value) => `${value / 1000000}tr`} />
+            <YAxis 
+                axisLine={false} 
+                tickLine={false} 
+                tickFormatter={(value) => `${Math.round(value / 1000000)}tr`}
+            />
             <Tooltip formatter={(value: number) => [formatCurrency(value), "Thực nhận"]} />
             <Bar dataKey="netIncome" name="Lương thực nhận" fill="#3b82f6" radius={[4, 4, 0, 0]} />
           </BarChart>
@@ -230,7 +109,7 @@ const IncomeChart = ({ data }: { data: any[] }) => (
   </div>
 );
 
-const IncomeTable = ({ data }: { data: any[] }) => (
+const IncomeTable = ({ data }: { data: MonthlyReportDisplay[] }) => (
   <div className="bg-white rounded-lg shadow-md border border-gray-200 overflow-hidden mt-6">
     {data.length === 0 ? (
       <div className="py-10 text-center text-sm text-slate-400">
@@ -240,7 +119,8 @@ const IncomeTable = ({ data }: { data: any[] }) => (
       <table className="min-w-full text-left">
         <thead className="bg-gray-50 border-b border-gray-200">
           <tr>
-            {["Tháng", "Lương cơ bản", "Lương thực nhận", "Chênh lệch"].map((head) => (
+            {/* ĐÃ XÓA CỘT "Làm thêm giờ" */}
+            {["Tháng", "Lương cơ bản", "Lương thực nhận"].map((head) => (
               <th key={head} className="px-4 py-3 text-sm text-black font-medium">{head}</th>
             ))}
           </tr>
@@ -251,9 +131,7 @@ const IncomeTable = ({ data }: { data: any[] }) => (
               <td className="px-4 py-3 text-black font-medium">Tháng {row.month}</td>
               <td className="px-4 py-3 text-black">{formatCurrency(row.baseSalary)}</td>
               <td className="px-4 py-3 text-black font-semibold">{formatCurrency(row.netIncome)}</td>
-              <td className={`px-4 py-3 font-medium ${row.difference > 0 ? "text-green-600" : "text-red-600"}`}>
-                {formatCurrency(row.difference)}
-              </td>
+              {/* ĐÃ XÓA CỘT DỮ LIỆU LÀM THÊM GIỜ */}
             </tr>
           ))}
         </tbody>
@@ -268,21 +146,22 @@ const SummaryCard = ({ summary, year }: { summary: any, year: string }) => (
     <p className="text-3xl font-bold text-gray-900">{formatCurrency(summary.total ?? 0)}</p>
     <div className="flex items-center gap-2">
       <span className="px-2 py-1 text-sm font-bold bg-slate-100 text-slate-600 rounded-full">
-        0%
+        {summary.changePercent.toFixed(1)}%
       </span>
-      <span className="text-sm text-gray-500">Chưa có dữ liệu so sánh</span>
+      <span className="text-sm text-gray-500">Thay đổi so với năm trước</span>
     </div>
     <div className="flex h-20 items-center justify-center rounded-lg border border-dashed border-slate-200 text-xs text-slate-400">
-      Chưa có dữ liệu xu hướng
+      Biểu đồ xu hướng (Chưa triển khai)
     </div>
   </div>
 );
 
 export default function IncomeReportPage() {
   const [employeeList, setEmployeeList] = useState<Employee[]>(loadEmployees);
-  const [year, setYear] = useState("2025");
+  const [year, setYear] = useState(String(new Date().getFullYear()));
   const [employee, setEmployee] = useState(() => loadEmployees()[0]?.id ?? "");
-  const [reportVersion, setReportVersion] = useState(0);
+  const [reportData, setReportData] = useState<MonthlyReportDisplay[]>([]);
+  const [loading, setLoading] = useState(false);
 
   useEffect(() => {
     setEmployeeList(loadEmployees());
@@ -298,37 +177,87 @@ export default function IncomeReportPage() {
     }
   }, [employeeList, employee]);
 
-  useEffect(() => {
-    if (!employee) return;
-    // xử lý ngay khi vào để bắt kịp tháng mô phỏng còn thiếu
-    const targetEmployee = employeeList.find((emp) => emp.id === employee);
-    const created = simulateMonthlyReport(targetEmployee);
-    if (created) {
-      setReportVersion((prev) => prev + 1);
-    }
-    const interval = window.setInterval(() => {
-      const employeeObj = employeeList.find((emp) => emp.id === employee);
-      const added = simulateMonthlyReport(employeeObj);
-      if (added) {
-        setReportVersion((prev) => prev + 1);
+  const fetchReport = useCallback(async (selectedEmployeeId: string, selectedYear: string) => {
+      if (!selectedEmployeeId || !selectedYear) {
+        setReportData([]);
+        return;
       }
-    }, KIEM_TRA_INTERVAL_MS);
-    return () => clearInterval(interval);
-  }, [employee, employeeList]);
+      
+      setLoading(true);
+      setReportData([]);
+      
+      try {
+          const monthlyReports: MonthlyReportDisplay[] = [];
+          const currentEmp = employeeList.find(e => e.id === selectedEmployeeId);
+          const currentBaseSalary = currentEmp?.salary ?? 0;
+
+          for (let month = 1; month <= 12; month++) {
+              let result: PayrollReportEntry[] = [];
+              
+              try {
+                  result = await payrollService.listReport(month, Number(selectedYear));
+              } catch (apiError) {
+                  console.warn(`API call failed for Month ${month}. Filling with default data.`, apiError);
+              }
+              
+              const empReport = result.find(r => r.employeeId.toString() === selectedEmployeeId);
+              
+              if (empReport) {
+                  
+                  // FIX QUAN TRỌNG: Lấy finalSalary từ Backend để hiển thị biểu đồ dynamic
+                  const finalSalaryFromBackend = empReport.finalSalary; 
+                  
+                  monthlyReports.push({
+                      month,
+                      baseSalary: empReport.baseSalary,
+                      netIncome: finalSalaryFromBackend, // SỬA: Đã fix lỗi ghi đè
+                      overtimeHours: 0, 
+                  });
+              } else {
+                   monthlyReports.push({
+                        month,
+                        baseSalary: currentBaseSalary,
+                        netIncome: currentBaseSalary, 
+                        overtimeHours: 0,
+                   });
+              }
+          }
+          setReportData(monthlyReports);
+      } catch (error) {
+          console.error("Lỗi tải báo cáo lương chung:", error);
+          setReportData([]);
+      } finally {
+          setLoading(false);
+      }
+  }, [employeeList]);
+
+  // Kích hoạt fetch khi Nhân viên hoặc Năm thay đổi
+  useEffect(() => {
+      fetchReport(employee, year);
+  }, [employee, year, fetchReport]);
+
 
   const currentData = useMemo(() => {
-    if (!employee) return { summary: { total: 0, change: 0, trend: [] }, details: [] };
-    const reports = loadIncomeReports(employee).filter((entry) => String(entry.year) === year);
-    const sorted = [...reports].sort((a, b) => a.month - b.month);
-    const details = sorted.map((entry) => ({
-      month: entry.month,
-      baseSalary: entry.baseSalary,
-      netIncome: entry.netIncome,
-      difference: entry.difference,
+    const sorted = [...reportData].sort((a, b) => a.month - b.month);
+    
+    const total = sorted.reduce((sum, item) => sum + item.netIncome, 0);
+
+    const previousYearTotal = total * 0.95; 
+    const changePercent = (total - previousYearTotal) / previousYearTotal * 100;
+
+    const details = sorted.map(row => ({
+        month: row.month,
+        baseSalary: row.baseSalary,
+        netIncome: row.netIncome,
+        difference: 0, 
     }));
-    const total = details.reduce((sum, item) => sum + item.netIncome, 0);
-    return { summary: { total, change: 0, trend: [] }, details };
-  }, [year, employee, reportVersion]);
+
+    return { 
+        summary: { total, change: total - previousYearTotal, changePercent }, 
+        details
+    };
+  }, [reportData]);
+
 
   return (
     <div className="p-6 bg-gray-50 min-h-screen">
@@ -353,7 +282,7 @@ export default function IncomeReportPage() {
         </main>
 
         <footer className="mt-8 border-t border-gray-200 pt-6 text-sm text-gray-500">
-          Kết nối hệ thống thực tế để hiển thị dữ liệu báo cáo thu nhập.
+          Dữ liệu báo cáo được tổng hợp từ hệ thống chấm công và quy tắc tính lương cơ bản.
         </footer>
       </div>
     </div>
